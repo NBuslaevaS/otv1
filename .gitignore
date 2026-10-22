@@ -1,0 +1,9 @@
+.venv/
+.venv_old/
+.venv.empty/
+__pycache__/
+certs/
+backups/
+*.log
+*.pid
+test_speech.*

@@ -1,0 +1,33 @@
+# === КРИТИЧНЫЕ ПАКЕТЫ ===
+# Трансформеры и модели перевода/синтеза
+transformers>=4.48.0
+# На машине с CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu126
+# (или cpu-сборка: --index-url https://download.pytorch.org/whl/cpu)
+torch>=2.5.1
+tokenizers>=0.20.1
+
+# Whisper — ASR (распознавание речи)
+faster-whisper>=1.0.0
+
+# HuggingFace Hub для загрузок моделей
+huggingface-hub>=0.27.0
+
+# Аудио-обработка
+edge-tts>=7.0.0
+ctranslate2>=4.4.0
+librosa>=0.11.0
+soundfile>=0.13.1
+resampy>=0.4.3
+pydub>=0.25.1
+
+# Нейросети и ускорение
+numba>=0.60.0
+accelerate>=0.34.2
+
+# Данные
+datasets>=3.1.0
+
+# Веб-сервер
+fastapi[all]>=0.115.2
+# HTTPS (автогенерация самоподписанного сертификата)
+cryptography>=42.0.0
