@@ -41,7 +41,7 @@ C:\OTV1\.venv\Scripts\python.exe C:\OTV1\test_e2e.py
 
 | Переменная | Дефолт | Эффект |
 |---|---|---|
-| `OTV_WHISPER_MODEL` | `medium` | `small` — ASR ~в 2 раза быстрее, качество чуть ниже |
+| `OTV_WHISPER_MODEL` | `medium` |  (вариант поточнее: `deepdml/faster-whisper-large-v3-turbo-ct2` — на этом CPU на грани реального времени, ~3.0 с на 3-с чанк против 2.2 с у medium) `small` — ASR ~в 2 раза быстрее, качество чуть ниже |
 | `OTV_NLLB_MODEL` | `facebook/nllb-200-distilled-1.3B` | полная 1.3B — лучший перевод; `600M` — легче, но ниже качеством |
 | `OTV_NLLB_QUANT` | `1` (int8) | int8-квантизация 1.3B: **0.63 с/фразу против 2.0 (fp32) и 0.96 (600M fp32)** — быстрее всех и качество полной 1.3B; `0` — fp32 |
 | `OTV_CHUNK_SEC` | `3.0` | меньше — быстрее отклик, но режет фразы и хуже переводит обрывки |
