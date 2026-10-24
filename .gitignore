@@ -7,3 +7,4 @@ backups/
 *.log
 *.pid
 test_speech.*
+.server_pid

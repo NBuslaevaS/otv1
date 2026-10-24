@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import threading
 import numpy as np
 import torch
@@ -15,16 +16,32 @@ logger = logging.getLogger("online-translate")
 
 app = FastAPI()
 
+# ===== Конфигурация live-конвейера (задержки), переопределяется переменными окружения =====
+# На CPU задержка трансляции = скорость моделей + скорость обработки. Всё настраивается:
+OTV_WHISPER_MODEL = os.environ.get("OTV_WHISPER_MODEL", "medium")  # "small" — заметно быстрее, качество чуть ниже
+OTV_NLLB_MODEL = os.environ.get("OTV_NLLB_MODEL", "facebook/nllb-200-distilled-600M")  # ~2x быстрее 1.3B
+OTV_CHUNK_SEC = float(os.environ.get("OTV_CHUNK_SEC", "3.0"))      # длина распознаваемого фрагмента (меньше — быстрее, но режет фразы)
+WHISPER_THREADS = int(os.environ.get("OTV_WHISPER_THREADS", "8"))  # потоки ctranslate2 (Whisper)
+TORCH_THREADS = int(os.environ.get("OTV_TORCH_THREADS", "6"))      # потоков torch на ОДНУ генерацию (три перевода идут параллельно)
+torch.set_num_threads(TORCH_THREADS)
+
 # Проверяем доступность GPU
 device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Используется устройство: {device}")
 
-# 1. Загружаем Whisper (модель medium сбалансирована по скорости/качеству)
-whisper_model = WhisperModel("medium", device=device, compute_type="float16" if device == "cuda" else "int8")
-# 2. Загружаем мультиязычный переводчик Meta NLLB-200 (1.3B параметров)
-nllb_model_name = "facebook/nllb-200-distilled-1.3B"
-tokenizer = AutoTokenizer.from_pretrained(nllb_model_name)
-translation_model = AutoModelForSeq2SeqLM.from_pretrained(nllb_model_name).to(device)
+# 1. Загружаем Whisper (ASR). cpu_threads ограничен, чтобы ядра оставались трём потокам-переводчикам.
+whisper_model = WhisperModel(OTV_WHISPER_MODEL, device=device,
+                             compute_type="float16" if device == "cuda" else "int8",
+                             cpu_threads=WHISPER_THREADS)
+# 2. Мультиязычный переводчик Meta NLLB-200: модель ОДНА, но у каждого потока-переводчика
+#    свой экземпляр токенизатора (set_src/set_tgt мутируют его состояние — общий нельзя).
+try:
+    nllb_model_name = OTV_NLLB_MODEL
+    translation_model = AutoModelForSeq2SeqLM.from_pretrained(nllb_model_name).to(device).eval()
+except Exception:
+    logger.exception(f"Не удалось загрузить {OTV_NLLB_MODEL}, откат на facebook/nllb-200-distilled-1.3B")
+    nllb_model_name = "facebook/nllb-200-distilled-1.3B"
+    translation_model = AutoModelForSeq2SeqLM.from_pretrained(nllb_model_name).to(device).eval()
 if device == "cuda":
     translation_model.half()  # fp16: ~2x быстрее и меньше VRAM
 
@@ -37,33 +54,33 @@ NLLB_LANG_CODES = {
     "es": "spa_Latn"
 }
 
-# Предрассчитанные ID токенов целевых языков (transformers 5.x: lang_code_to_id удалён)
-NLLB_TGT_TOKEN_IDS = {code: tokenizer.convert_tokens_to_ids(code) for code in NLLB_LANG_CODES.values()}
+TRANSLATE_LANGS = ("en", "de", "zh")  # ru -> эти языки, каждый в своём отдельном потоке
 
-_translate_lock = threading.Lock()  # set_src/set_tgt мутируют состояние токенизатора — защищаем от параллельных вызовов
 
-def translate_text(text: str, src_lang: str, tgt_lang: str) -> str:
-    """Функция перевода текста с помощью NLLB-200 на GPU"""
-    if src_lang == tgt_lang:
-        return text
-    
+def make_tokenizer():
+    """Отдельный экземпляр токенизатора для потока-переводчика."""
+    return AutoTokenizer.from_pretrained(nllb_model_name)
+
+
+def translate_with(tokenizer, text: str, src_lang: str, tgt_lang: str) -> str:
+    """Перевод текста NLLB-200 своим токенизатором (не разделяется между потоками) — лок не нужен."""
     src_code = NLLB_LANG_CODES.get(src_lang)
     tgt_code = NLLB_LANG_CODES.get(tgt_lang)
     if src_code is None or tgt_code is None:
         raise ValueError(f"Неподдерживаемый язык: src={src_lang}, tgt={tgt_lang}")
-    
-    with _translate_lock:
-        tokenizer.set_src_lang_special_tokens(src_code)
-        tokenizer.set_tgt_lang_special_tokens(tgt_code)
-        inputs = tokenizer(text, return_tensors="pt", add_special_tokens=True).to(device)
-        with torch.inference_mode():
-            translated_tokens = translation_model.generate(
-                **inputs, 
-                forced_bos_token_id=NLLB_TGT_TOKEN_IDS[tgt_code], 
-                max_length=256
-            )
-    result = tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
-    return result
+    if src_lang == tgt_lang:
+        return text
+    tokenizer.set_src_lang_special_tokens(src_code)
+    tokenizer.set_tgt_lang_special_tokens(tgt_code)
+    inputs = tokenizer(text, return_tensors="pt", add_special_tokens=True).to(device)
+    with torch.inference_mode():
+        translated_tokens = translation_model.generate(
+            **inputs,
+            forced_bos_token_id=tokenizer.convert_tokens_to_ids(tgt_code),
+            max_length=256
+        )
+    return tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
+
 
 # Хранилище HTML-интерфейса (для простоты запуска в одном файле)
 HTML_TEMPLATE = """
@@ -193,79 +210,122 @@ HTML_TEMPLATE = """
 async def get():
     return HTMLResponse(HTML_TEMPLATE)
 
+def _put_latest(q, item) -> None:
+    """Ставит элемент в очередь; если она полна — выбрасывает самый старый фрагмент.
+    Лучше потерять звук давней паузы, чем копить всё растущую задержку трансляции."""
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            pass
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """Конвейер с малой задержкой вместо последовательной обработки.
+
+    Старая версия обрабатывала фрагмент ПОСЛЕДОВАТЕЛЬНО прямо в цикле приёма
+    (ASR + 3 перевода через общий лок ≈ 10 с): пока идет обработка, новые байты
+    микрофона копятся в сокете, и задержка растёт всю лекцию.
+    Теперь цикл приёма только кладёт аудио в очередь, а обработка параллельная:
+    ASR-поток (сразу шлёт оригинал) -> 3 потока-переводчика (en/de/zh),
+    каждый со своим токенизатором; результаты складываются в исходящую очередь.
+    """
     await websocket.accept()
-    
-    # Буфер накопления звука (накапливаем фрагменты по ~3 секунды для качественного контекста перевода)
-    audio_buffer = []
-    chunk_size_threshold = 16000 * 3  
-    
-    async def process_buffer(audio_np):
-        """Распознавание + перевод одного фрагмента. Ошибки логируем, не роняем соединение."""
-        loop = asyncio.get_running_loop()
-        try:
-            # VAD отсекает тишину — меньше галлюцинаций Whisper на паузах; beam_size=1 для live-задержки
-            segments, info = await loop.run_in_executor(
-                None, lambda: whisper_model.transcribe(audio_np, beam_size=1, language="ru", vad_filter=True)
-            )
-            text_orig = "".join([segment.text for segment in segments]).strip()
+    loop = asyncio.get_running_loop()
+    chunk_samples = int(16000 * OTV_CHUNK_SEC)
+
+    audio_q = queue.Queue(maxsize=40)                                     # ~100 с аудио максимум
+    text_qs = {lang: queue.Queue(maxsize=32) for lang in TRANSLATE_LANGS}
+    out_q = asyncio.Queue()
+
+    def asr_worker():
+        while True:
+            buf = audio_q.get()
+            if buf is None:
+                break
+            try:
+                # VAD отсекает тишину — меньше галлюцинаций Whisper на паузах; beam_size=1 для live-задержки
+                segments, _info = whisper_model.transcribe(buf, beam_size=1, language="ru", vad_filter=True)
+                text_orig = "".join(s.text for s in segments).strip()
+            except Exception:
+                logger.exception("Ошибка распознавания аудио-фрагмента")
+                continue
             if not text_orig:
-                return
+                continue
+            # Оригинал уходит в браузер сразу, не дожидаясь переводов
+            loop.call_soon_threadsafe(out_q.put_nowait, {"ru": text_orig})
+            for tq in text_qs.values():
+                _put_latest(tq, text_orig)
 
-            # Переводы запускаем параллельно (лок NLLB всё равно сериализует генерацию,
-            # но event loop не блокируется)
-            translations = await asyncio.gather(
-                loop.run_in_executor(None, translate_text, text_orig, "ru", "en"),
-                loop.run_in_executor(None, translate_text, text_orig, "ru", "de"),
-                loop.run_in_executor(None, translate_text, text_orig, "ru", "zh"),
-            )
-            response_data = {
-                "ru": text_orig,
-                "en": translations[0],
-                "de": translations[1],
-                "zh": translations[2],
-            }
-        except Exception:
-            logger.exception("Ошибка обработки аудио-фрагмента")
-            return
+    def trans_worker(lang):
+        tokenizer = make_tokenizer()  # собственный токенизатор — без мутаций между потоками
+        tq = text_qs[lang]
+        while True:
+            text = tq.get()
+            if text is None:
+                break
+            try:
+                translated = translate_with(tokenizer, text, "ru", lang)
+            except Exception:
+                logger.exception(f"Ошибка перевода фрагмента ({lang})")
+                continue
+            if translated:
+                loop.call_soon_threadsafe(out_q.put_nowait, {lang: translated})
 
+    threads = [threading.Thread(target=asr_worker, daemon=True, name="asr-worker")]
+    threads += [threading.Thread(target=trans_worker, args=(lang,), daemon=True, name=f"tr-{lang}")
+                for lang in TRANSLATE_LANGS]
+    for t in threads:
+        t.start()
+
+    async def sender():
         try:
-            await websocket.send_text(json.dumps(response_data))
+            while True:
+                data = await out_q.get()
+                await websocket.send_text(json.dumps(data, ensure_ascii=False))
         except Exception:
-            logger.warning("Не удалось отправить ответ (соединение закрыто)")
+            pass  # соединение закрыто — завершаемся тихо
 
-    async def flush_buffer():
-        """Обработка остатка буфера (<3 с) — чтобы хвост речи не терялся."""
-        if len(audio_buffer) >= 16000 * 0.5:  # минимум ~полсекунды звука, иначе тишина
-            audio_np = np.array(audio_buffer, dtype=np.float32)
-            audio_buffer.clear()
-            await process_buffer(audio_np)
-
+    sender_task = asyncio.create_task(sender())
+    audio_buffer = []
     try:
         while True:
-            # Получаем бинарные данные аудио от браузера
+            # Получаем бинарные данные аудио от браузера; обработка НЕ блокирует приём
             bytes_data = await websocket.receive_bytes()
-            audio_chunk = np.frombuffer(bytes_data, dtype=np.float32)
-            audio_buffer.extend(audio_chunk)
-
-            if len(audio_buffer) >= chunk_size_threshold:
-                audio_np = np.array(audio_buffer, dtype=np.float32)
-                audio_buffer.clear()  # сброс буфера
-                await process_buffer(audio_np)
-
+            audio_buffer.extend(np.frombuffer(bytes_data, dtype=np.float32))
+            while len(audio_buffer) >= chunk_samples:
+                audio_np = np.array(audio_buffer[:chunk_samples], dtype=np.float32)
+                del audio_buffer[:chunk_samples]
+                _put_latest(audio_q, audio_np)
     except Exception as e:
         logger.info(f"Соединение закрыто или ошибка: {e}")
     finally:
-        # Финальный flush — хвост речи доходит до распознавания
+        # Хвост речи (< полного фрагмента, но >=0.5 с) тоже отправляем, чтобы не терялся
+        if len(audio_buffer) >= int(16000 * 0.5):
+            _put_latest(audio_q, np.array(audio_buffer, dtype=np.float32))
+        audio_q.put(None)
         try:
-            await flush_buffer()
+            # ждём окончания распознавания хвоста, затем закрываем переводчиков
+            await loop.run_in_executor(None, lambda: threads[0].join(timeout=60))
+            for tq in text_qs.values():
+                tq.put(None)
+            await loop.run_in_executor(None, lambda: [t.join(timeout=30) for t in threads[1:]])
         except Exception:
             pass
+        sender_task.cancel()
         try:
             await websocket.close()
         except Exception:
             pass  # клиент уже отключился — traceback не нужен
+
+
 
 def ensure_ssl_certificates(cert_dir):
     """Генерирует самоподписанный сертификат (если нет или сменились IP машины).
