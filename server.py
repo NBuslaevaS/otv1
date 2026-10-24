@@ -19,7 +19,10 @@ app = FastAPI()
 # ===== Конфигурация live-конвейера (задержки), переопределяется переменными окружения =====
 # На CPU задержка трансляции = скорость моделей + скорость обработки. Всё настраивается:
 OTV_WHISPER_MODEL = os.environ.get("OTV_WHISPER_MODEL", "medium")  # "small" — заметно быстрее, качество чуть ниже
-OTV_NLLB_MODEL = os.environ.get("OTV_NLLB_MODEL", "facebook/nllb-200-distilled-600M")  # ~2x быстрее 1.3B
+OTV_NLLB_MODEL = os.environ.get("OTV_NLLB_MODEL", "facebook/nllb-200-distilled-1.3B")
+# int8-квантизация линейных слоёв: 1.3B становится ~3x быстрее fp32 на CPU и быстрее 600M fp32
+# (замер: 0.63 с/фразу против 0.96 у 600M и 2.0 у 1.3B fp32), качество перевода как у полной 1.3B.
+OTV_NLLB_QUANT = os.environ.get("OTV_NLLB_QUANT", "1")  # "0" — fp32 (медленнее, смысла на CPU нет)
 OTV_CHUNK_SEC = float(os.environ.get("OTV_CHUNK_SEC", "3.0"))      # длина распознаваемого фрагмента (меньше — быстрее, но режет фразы)
 WHISPER_THREADS = int(os.environ.get("OTV_WHISPER_THREADS", "8"))  # потоки ctranslate2 (Whisper)
 TORCH_THREADS = int(os.environ.get("OTV_TORCH_THREADS", "6"))      # потоков torch на ОДНУ генерацию (три перевода идут параллельно)
@@ -38,9 +41,14 @@ whisper_model = WhisperModel(OTV_WHISPER_MODEL, device=device,
 try:
     nllb_model_name = OTV_NLLB_MODEL
     translation_model = AutoModelForSeq2SeqLM.from_pretrained(nllb_model_name).to(device).eval()
+    if OTV_NLLB_QUANT == "1" and device == "cpu":
+        import torch.ao.quantization
+        translation_model = torch.ao.quantization.quantize_dynamic(
+            translation_model, {torch.nn.Linear}, dtype=torch.qint8)
+        logger.info("NLLB: int8 dynamic quantization enabled")
 except Exception:
-    logger.exception(f"Не удалось загрузить {OTV_NLLB_MODEL}, откат на facebook/nllb-200-distilled-1.3B")
-    nllb_model_name = "facebook/nllb-200-distilled-1.3B"
+    logger.exception(f"Не удалось загрузить {OTV_NLLB_MODEL}, откат на facebook/nllb-200-distilled-600M")
+    nllb_model_name = "facebook/nllb-200-distilled-600M"
     translation_model = AutoModelForSeq2SeqLM.from_pretrained(nllb_model_name).to(device).eval()
 if device == "cuda":
     translation_model.half()  # fp16: ~2x быстрее и меньше VRAM
