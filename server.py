@@ -93,68 +93,383 @@ def translate_with(tokenizer, text: str, src_lang: str, tgt_lang: str) -> str:
 # Хранилище HTML-интерфейса (для простоты запуска в одном файле)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html>
+<html lang="ru">
 <head>
-    <title>Локальный Синхронный Переводчик</title>
-    <style>
-        body { font-family: sans-serif; background: #1a1a1a; color: #fff; margin: 20px; }
-        .controls { margin-bottom: 20px; padding: 15px; background: #2a2a2a; border-radius: 8px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-        .lang-box { background: #222; border: 2px solid #444; border-radius: 8px; padding: 15px; height: 60vh; overflow-y: auto; }
-        .lang-box h2 { margin-top: 0; color: #00adb5; border-bottom: 1px solid #444; padding-bottom: 5px; }
-        .text-content { font-size: 24px; line-height: 1.4; white-space: pre-wrap; }
-        button { background: #00adb5; border: none; color: white; padding: 10px 20px; font-size: 16px; border-radius: 5px; cursor: pointer; }
-        button:disabled { background: #555; }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Локальный Синхронный Переводчик</title>
+<style>
+    :root {
+        --accent1: #22d3ee;
+        --accent2: #818cf8;
+        --accent3: #e879f9;
+        --glass: rgba(255, 255, 255, 0.055);
+        --glass-border: rgba(255, 255, 255, 0.13);
+        --text-soft: rgba(235, 240, 255, 0.72);
+    }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+    body {
+        margin: 0; color: #eef2ff;
+        font-family: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+        background: #0b1020;
+        background-image:
+            radial-gradient(1100px 620px at 15% -10%, rgba(56, 189, 248, 0.16), transparent 60%),
+            radial-gradient(1000px 700px at 110% 10%, rgba(167, 139, 250, 0.17), transparent 60%),
+            radial-gradient(900px 620px at 50% 115%, rgba(232, 121, 249, 0.12), transparent 60%);
+        background-attachment: fixed;
+        overflow-x: hidden;
+    }
+    /* «Живой» фон: медленно плывущие световые пятна */
+    .blob { position: fixed; border-radius: 50%; filter: blur(90px); opacity: .5; z-index: -1; animation: drift 26s ease-in-out infinite alternate; }
+    .blob.b1 { width: 520px; height: 520px; left: -140px; top: -160px; background: rgba(34, 211, 238, 0.22); }
+    .blob.b2 { width: 560px; height: 560px; right: -160px; top: 4%; background: rgba(129, 140, 248, 0.20); animation-delay: -9s; }
+    .blob.b3 { width: 620px; height: 620px; left: 28%; bottom: -260px; background: rgba(232, 121, 249, 0.14); animation-delay: -17s; }
+    @keyframes drift {
+        0%   { transform: translate(0, 0) scale(1); }
+        50%  { transform: translate(60px, 40px) scale(1.12); }
+        100% { transform: translate(-40px, 70px) scale(0.95); }
+    }
+
+    /* ===== Приветственный экран ===== */
+    .welcome {
+        min-height: 100vh; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; text-align: center;
+        padding: 40px 20px; gap: 0;
+    }
+    h1.title {
+        margin: 0 0 18px; font-weight: 800; line-height: 1.12;
+        font-size: clamp(34px, 6vw, 68px); letter-spacing: -1px;
+        background: linear-gradient(100deg, #67e8f9 0%, #a5b4fc 45%, #f0abfc 80%);
+        -webkit-background-clip: text; background-clip: text;
+        -webkit-text-fill-color: transparent; color: transparent;
+        text-shadow: 0 0 90px rgba(129, 140, 248, 0.35);
+        animation: fadeUp .7s .1s ease both;
+    }
+    .subtitle {
+        margin: 0 auto 44px; max-width: 720px;
+        font-size: clamp(17px, 2.2vw, 22px); color: var(--text-soft); line-height: 1.55;
+        animation: fadeUp .7s .2s ease both;
+    }
+    .subtitle b { color: #dbeafe; font-weight: 600; }
+    @keyframes fadeUp { from { opacity: 0; transform: translateY(22px); } to { opacity: 1; transform: none; } }
+
+    /* ===== Стеклянные карточки ===== */
+    .card {
+        width: min(640px, 94vw); padding: 30px 34px; border-radius: 22px; text-align: left;
+        background: var(--glass); border: 1px solid var(--glass-border);
+        backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+        animation: fadeUp .55s ease both; margin-bottom: 18px;
+    }
+    .step-question { font-size: 21px; font-weight: 600; margin: 0 0 22px; }
+
+    /* Счётчик языков с кнопками - / + */
+    .counter { display: flex; align-items: center; justify-content: center; gap: 16px; margin: 6px 0 24px; }
+    .counter button {
+        width: 54px; height: 54px; border-radius: 50%; font-size: 26px; line-height: 1;
+        border: 1px solid var(--glass-border); background: rgba(255, 255, 255, 0.07);
+        color: #eef2ff; cursor: pointer; transition: .18s;
+    }
+    .counter button:hover { background: rgba(103, 232, 249, 0.18); transform: translateY(-2px); }
+    .counter input {
+        width: 92px; height: 74px; text-align: center; font-size: 40px; font-weight: 700;
+        color: #fff; background: rgba(0, 0, 0, 0.28);
+        border: 1px solid var(--glass-border); border-radius: 16px; outline: none;
+        transition: .2s; -moz-appearance: textfield;
+    }
+    .counter input:focus { border-color: var(--accent1); box-shadow: 0 0 0 4px rgba(34, 211, 238, 0.18); }
+    .counter input::-webkit-outer-spin-button, .counter input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .counter-note { text-align: center; color: var(--text-soft); font-size: 14px; margin-bottom: 22px; }
+
+    .btn {
+        display: block; width: 100%; padding: 16px 26px; border: none; border-radius: 14px;
+        font-size: 17px; font-weight: 700; letter-spacing: .3px; color: #06121f; cursor: pointer;
+        background: linear-gradient(100deg, var(--accent1), var(--accent2));
+        box-shadow: 0 12px 34px rgba(56, 189, 248, 0.35); transition: .18s;
+    }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 16px 42px rgba(129, 140, 248, 0.45); }
+    .btn:active { transform: translateY(0); }
+    .btn:disabled { background: #3a4152; color: #98a2b8; box-shadow: none; cursor: default; transform: none; }
+    .btn.ghost {
+        background: transparent; color: var(--text-soft); border: 1px solid var(--glass-border);
+        box-shadow: none; font-weight: 500;
+    }
+    .btn.ghost:hover { color: #fff; background: rgba(255, 255, 255, 0.06); }
+    .btn.danger { background: linear-gradient(100deg, #fb7185, #f43f5e); color: #fff; box-shadow: 0 12px 34px rgba(244, 63, 94, 0.32); }
+
+    .error { color: #fda4af; font-size: 14px; min-height: 20px; margin: 12px 0 0; text-align: center; }
+
+    /* Списки языков */
+    .lang-row {
+        display: flex; align-items: center; gap: 14px; padding: 11px 14px; margin-bottom: 10px;
+        background: rgba(0, 0, 0, 0.22); border: 1px solid rgba(255, 255, 255, 0.07);
+        border-radius: 14px; transition: .2s;
+    }
+    .lang-row:hover { border-color: rgba(103, 232, 249, 0.4); }
+    .lang-row .num {
+        width: 34px; height: 34px; flex: 0 0 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+        font-weight: 700; font-size: 15px; color: #06121f;
+        background: linear-gradient(135deg, var(--accent1), var(--accent2));
+    }
+    .lang-row select {
+        flex: 1; padding: 12px 14px; font-size: 16px; color: #eef2ff; outline: none; cursor: pointer;
+        background: rgba(255, 255, 255, 0.07); border: 1px solid var(--glass-border); border-radius: 10px;
+        transition: .2s;
+    }
+    .lang-row select:focus, .lang-row select:hover { border-color: var(--accent1); }
+    .lang-row option { background: #151b2e; color: #eef2ff; }
+    .row-actions { display: flex; gap: 12px; margin-top: 18px; }
+    .row-actions .btn { width: auto; flex: 1; padding: 14px 22px; }
+
+    /* ===== Экран трансляции ===== */
+    .live-wrap { display: none; min-height: 100vh; padding: 26px 28px; flex-direction: column; }
+    .live-head {
+        display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+        padding: 16px 22px; margin-bottom: 22px; border-radius: 18px;
+        background: var(--glass); border: 1px solid var(--glass-border); backdrop-filter: blur(18px);
+    }
+    .live-head .live-title {
+        font-size: 19px; font-weight: 700; margin-right: auto;
+        background: linear-gradient(100deg, #67e8f9, #c4b5fd);
+        -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .mic-dot { width: 11px; height: 11px; border-radius: 50%; background: #64748b; margin-right: 8px; display: inline-block; }
+    .mic-dot.on { background: #f43f5e; animation: pulse 1.4s infinite; }
+    @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(244, 63, 94, 0.55); } 50% { box-shadow: 0 0 0 9px rgba(244, 63, 94, 0); } }
+    .status { color: var(--text-soft); font-size: 14.5px; }
+    .live-head .btn { width: auto; padding: 11px 24px; font-size: 15px; }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; flex: 1; align-content: start; }
+    .lang-box {
+        background: var(--glass); border: 1px solid var(--glass-border); border-radius: 20px;
+        padding: 20px 22px; height: 62vh; overflow-y: auto; backdrop-filter: blur(14px);
+        box-shadow: 0 18px 44px rgba(0, 0, 0, 0.30); animation: fadeUp .5s ease both;
+        transition: border-color .3s;
+    }
+    .lang-box:hover { border-color: rgba(103, 232, 249, 0.35); }
+    .lang-box h2 {
+        margin: 0 0 14px; font-size: 17px; letter-spacing: .4px; color: #c7d2fe;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.10); padding-bottom: 10px;
+        position: sticky; top: -20px; background: #141a2e;
+    }
+    .lang-box .text-content { font-size: 23px; line-height: 1.5; white-space: pre-wrap; color: #f1f5ff; }
+
+    ::-webkit-scrollbar { width: 9px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16); border-radius: 8px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.28); }
+
+    @media (max-width: 640px) {
+        .card { padding: 24px 20px; }
+        .live-wrap { padding: 14px; }
+        .lang-box { height: 40vh; }
+        .lang-box .text-content { font-size: 19px; }
+    }
+</style>
 </head>
 <body>
-    <div class="controls">
-        <button id="startBtn">Включить трансляцию на проектор</button>
-        <button id="stopBtn" style="margin-left:10px; display:none;">Остановить</button>
-        <span id="status" style="margin-left: 15px; color: #aaa;">Ожидание запуска...</span>
+    <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+
+    <!-- ===== Приветственный экран: заголовок по центру ===== -->
+    <div class="welcome" id="welcomeScreen">
+        <h1 class="title">Локальный синхронный<br>переводчик</h1>
+        <p class="subtitle"><b>Добро пожаловать на сервис!</b><br>Выберите количество языков для перевода лекций</p>
+
+        <!-- Шаг 1 -->
+        <div class="card" id="step1Card">
+            <p class="step-question" style="text-align:center;">На каком языке вы читаете лекцию?</p>
+            <div class="lang-row" style="max-width:360px;margin:0 auto 30px;">
+                <select id="srcLang"></select>
+                <style>#srcLang{width:100%;}</style>
+            </div>
+            <p class="step-question" style="text-align:center;">Сколько языков перевода нужно?</p>
+            <div class="counter">
+                <button type="button" id="minusBtn" title="Меньше">&minus;</button>
+                <input type="number" id="numLangs" min="1" max="4" value="3">
+                <button type="button" id="plusBtn" title="Больше">+</button>
+            </div>
+            <div class="counter-note">от 1 до 4 языков</div>
+            <button class="btn" id="buildBtn">Выбрать языки &#8594;</button>
+            <div class="error" id="setupError"></div>
+        </div>
+
+        <!-- Шаг 2 -->
+        <div class="card" id="langSelects" style="display:none;">
+            <p class="step-question" style="text-align:center;">Какие языки переводить?</p>
+            <div id="selectRows"></div>
+            <div class="row-actions">
+                <button class="btn ghost" id="backBtn">&#8592; Назад</button>
+                <button class="btn" id="applyBtn">Продолжить &#8594;</button>
+            </div>
+            <div class="error" id="applyError"></div>
+        </div>
     </div>
-    
-    <div class="grid">
-        <div class="lang-box"><h2>Оригинал (Русский)</h2><div id="box-ru" class="text-content"></div></div>
-        <div class="lang-box"><h2>English</h2><div id="box-en" class="text-content"></div></div>
-        <div class="lang-box"><h2>Deutsch</h2><div id="box-de" class="text-content"></div></div>
-        <div class="lang-box"><h2>中文 (Китайский)</h2><div id="box-zh" class="text-content"></div></div>
+
+    <!-- ===== Экран трансляции ===== -->
+    <div class="live-wrap" id="liveScreen">
+        <div class="live-head">
+            <span class="mic-dot" id="micDot"></span>
+            <span class="live-title">Локальный синхронный переводчик</span>
+            <span class="status" id="status"></span>
+            <button class="btn" id="startBtn">&#127908;&nbsp; Начать запись и трансляцию</button>
+            <button class="btn danger" id="stopBtn" style="display:none;">&#9632;&nbsp; Стоп</button>
+            <button class="btn ghost" id="changeBtn" style="display:none;">&#8634;&nbsp; Изменить языки</button>
+        </div>
+        <div class="grid" id="grid"></div>
     </div>
 
     <script>
         let ws;
         let audioContext = null;
         let userStopped = false;
-        const startBtn = document.getElementById('startBtn');
-        const stopBtn = document.getElementById('stopBtn');
-        const status = document.getElementById('status');
+        let targets = [];
 
-        function setStatus(text, color) {
-            status.innerText = text;
-            status.style.color = color || "#aaa";
+        // Поддерживаемые языки (NLLB + Whisper)
+        const LANGS = {
+            ru: { name: "Русский",   flag: "🇷🇺" },
+            en: { name: "English",   flag: "🇬🇧" },
+            de: { name: "Deutsch",   flag: "🇩🇪" },
+            zh: { name: "中文",       flag: "🇨🇳" },
+            es: { name: "Español",   flag: "🇪🇸" }
+        };
+        const TRANSLATE_ORDER = ["en", "de", "zh", "es"];   // языки перевода (без ru)
+        let sourceLang = "ru";                              // язык лекции
+
+        const $ = id => document.getElementById(id);
+        const numLangs = $("numLangs"), setupError = $("setupError"), applyError = $("applyError");
+        const step1Card = $("step1Card"), langSelects = $("langSelects"), selectRows = $("selectRows");
+        const welcomeScreen = $("welcomeScreen"), liveScreen = $("liveScreen");
+        const startBtn = $("startBtn"), stopBtn = $("stopBtn"), changeBtn = $("changeBtn");
+        const status = $("status"), grid = $("grid"), micDot = $("micDot");
+
+        function clampN() {
+            let n = parseInt(numLangs.value, 10);
+            if (isNaN(n)) n = 1;
+            numLangs.value = Math.min(4, Math.max(1, n));
         }
+        $("minusBtn").onclick = () => { numLangs.value = Math.max(1, (parseInt(numLangs.value,10)||1) - 1); };
+        $("plusBtn").onclick  = () => { numLangs.value = Math.min(4, (parseInt(numLangs.value,10)||1) + 1); };
+        numLangs.onchange = clampN;
 
-        function stop() {
+        // Язык лекции: любой из пяти; языки перевода — все, кроме выбранного
+        const srcLangSel = $("srcLang");
+        for (const [code, l] of Object.entries(LANGS)) {
+            const opt = document.createElement("option");
+            opt.value = code;
+            opt.innerText = l.flag + "  " + l.name;
+            if (code === "ru") opt.selected = true;
+            srcLangSel.appendChild(opt);
+        }
+        srcLangSel.onchange = () => { sourceLang = srcLangSel.value; };
+
+        function setStatus(text, color) { status.innerText = text; status.style.color = color || ""; }
+
+        function stopAudio() {
             try { if (audioContext) audioContext.close(); } catch (e) {}
             audioContext = null;
             try { if (ws) ws.close(); } catch (e) {}
-            startBtn.disabled = false;
+            micDot.classList.remove("on");
+        }
+
+        // Шаг 1: ввели количество N -> показываем N выпадающих списков
+        $("buildBtn").onclick = () => {
+            setupError.innerText = "";
+            sourceLang = srcLangSel.value;
+            const n = parseInt(numLangs.value, 10);
+            const maxN = Object.keys(LANGS).length - 1; // все языки, кроме языка лекции
+            if (isNaN(n) || n < 1 || n > maxN) {
+                setupError.innerText = "Укажите количество от 1 до " + maxN;
+                return;
+            }
+            // Для перевода доступны ВСЕ языки базы, кроме самого языка лекции
+            // (при иностранном языке лекции в списке оказывается и русский)
+            const options = Object.keys(LANGS).filter(c => c !== sourceLang);
+            if (n > options.length) {
+                setupError.innerText = "Для языка лекции доступно " + options.length + " язык(ов) перевода";
+                return;
+            }
+            selectRows.innerHTML = "";
+            for (let i = 0; i < n; i++) {
+                const row = document.createElement("div");
+                row.className = "lang-row";
+                const num = document.createElement("span");
+                num.className = "num"; num.innerText = i + 1;
+                const sel = document.createElement("select");
+                for (const code of options) {
+                    const opt = document.createElement("option");
+                    opt.value = code;
+                    opt.innerText = LANGS[code].flag + "  " + LANGS[code].name;
+                    if (code === options[i]) opt.selected = true;
+                    sel.appendChild(opt);
+                }
+                row.appendChild(num); row.appendChild(sel);
+                selectRows.appendChild(row);
+            }
+            step1Card.style.display = "none";
+            langSelects.style.display = "block";
+        };
+        $("backBtn").onclick = () => {
+            langSelects.style.display = "none";
+            step1Card.style.display = "block";
+        };
+
+        // Шаг 2: подтвердили языки -> окна с языками, как в первой версии
+        $("applyBtn").onclick = () => {
+            applyError.innerText = "";
+            const chosen = Array.from(selectRows.querySelectorAll("select")).map(s => s.value);
+            if (new Set(chosen).size !== chosen.length) {
+                applyError.innerText = "Языки не должны повторяться — выберите разные.";
+                return;
+            }
+            targets = chosen;
+            grid.innerHTML = "";
+            addBox(sourceLang, LANGS[sourceLang].flag + "  Оригинал · " + LANGS[sourceLang].name);
+            targets.forEach(l => addBox(l, LANGS[l].flag + "  " + LANGS[l].name));
+            welcomeScreen.style.display = "none";
+            liveScreen.style.display = "flex";
+            startBtn.style.display = "inline-block";
             stopBtn.style.display = "none";
+            changeBtn.style.display = "inline-block";
+            setStatus("Нажмите «Начать запись и трансляцию» и разрешите доступ к микрофону.");
+        };
+
+        $("changeBtn").onclick = () => {
+            stopAudio();
+            liveScreen.style.display = "none";
+            welcomeScreen.style.display = "flex";
+            langSelects.style.display = "none";
+            step1Card.style.display = "block";
+        };
+
+        function addBox(code, title) {
+            const box = document.createElement("div");
+            box.className = "lang-box";
+            const h = document.createElement("h2");
+            h.innerText = title;
+            const content = document.createElement("div");
+            content.id = "box-" + code;
+            content.className = "text-content";
+            box.appendChild(h); box.appendChild(content);
+            grid.appendChild(box);
         }
 
         async function start() {
             userStopped = false;
-            startBtn.disabled = true;
+            startBtn.style.display = "none";
+            changeBtn.style.display = "none";
             stopBtn.style.display = "inline-block";
             setStatus("Подключение к серверу AI...");
 
-            // Открываем WebSocket соединение
-            const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
             ws = new WebSocket(`${wsProto}//${window.location.host}/ws`);
 
             ws.onopen = async () => {
                 try {
-                    setStatus("Микрофон активен. Говорите...", "#4e9f3d");
+                    // Первым сообщением сообщаем серверу язык лекции и языки перевода
+                    ws.send(JSON.stringify({ source: sourceLang, targets: targets }));
+                    setStatus("Микрофон активен. Говорите...", "#86efac");
+                    micDot.classList.add("on");
 
                     // Захват аудио с микрофона лектора (16kHz, моно — стандарт для Whisper)
                     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -177,8 +492,8 @@ HTML_TEMPLATE = """
                         ws.send(inputData.buffer);
                     };
                 } catch (err) {
-                    setStatus("Ошибка микрофона: " + err.message, "#d9534f");
-                    stop();
+                    setStatus("Ошибка микрофона: " + err.message, "#fda4af");
+                    stopAudio(); resetButtons();
                 }
             };
 
@@ -195,19 +510,25 @@ HTML_TEMPLATE = """
                 }
             };
 
-            ws.onerror = () => setStatus("Ошибка соединения с сервером", "#d9534f");
+            ws.onerror = () => setStatus("Ошибка соединения с сервером", "#fda4af");
             ws.onclose = () => {
                 if (userStopped) return;
-                stop();
-                setStatus("Соединение закрыто. Нажмите «Включить» для перезапуска.", "#d9534f");
+                stopAudio(); resetButtons();
+                setStatus("Соединение закрыто. Нажмите «Начать запись» для перезапуска.", "#fda4af");
             };
+        }
+
+        function resetButtons() {
+            startBtn.style.display = "inline-block";
+            stopBtn.style.display = "none";
+            changeBtn.style.display = "inline-block";
         }
 
         startBtn.onclick = start;
         stopBtn.onclick = () => {
             userStopped = true;
-            stop();
-            setStatus("Остановлено. Нажмите «Включить» для перезапуска.");
+            stopAudio(); resetButtons();
+            setStatus("Остановлено. Можно перезапустить запись или изменить языки.");
         };
     </script>
 </body>
@@ -249,8 +570,34 @@ async def websocket_endpoint(websocket: WebSocket):
     loop = asyncio.get_running_loop()
     chunk_samples = int(16000 * OTV_CHUNK_SEC)
 
+    # Браузер первым сообщением (JSON) присылает язык лекции и языки перевода:
+    # {"source": "de", "targets": ["en", "zh"]}. Без сообщения — ru -> TRANSLATE_LANGS.
+    src_lang = "ru"
+    target_langs = list(TRANSLATE_LANGS)
+    try:
+        first = await asyncio.wait_for(websocket.receive_text(), timeout=5)
+        handshake = json.loads(first) if first.strip().startswith("{") else {}
+        req_src = handshake.get("source")
+        if req_src in NLLB_LANG_CODES:
+            src_lang = req_src
+        requested = handshake.get("targets")
+        if isinstance(requested, list) and requested:
+            valid = [l for l in dict.fromkeys(requested)
+                     if l in NLLB_LANG_CODES and l != src_lang]
+            if valid:
+                target_langs = valid
+            else:
+                target_langs = [l for l in TRANSLATE_LANGS if l != src_lang]
+        else:
+            target_langs = [l for l in TRANSLATE_LANGS if l != src_lang]
+        logger.info("Трансляция: %s -> %s", src_lang, ", ".join(target_langs))
+    except Exception:
+        target_langs = [l for l in target_langs if l != src_lang] or list(TRANSLATE_LANGS)
+        # без JSON-рукопожатия — ru -> языки по умолчанию
+
+    whisper_lang = src_lang  # у faster-whisper коды ru/en/de/zh/es совпадают с NLLB-кодами проекта
     audio_q = queue.Queue(maxsize=40)                                     # ~100 с аудио максимум
-    text_qs = {lang: queue.Queue(maxsize=32) for lang in TRANSLATE_LANGS}
+    text_qs = {lang: queue.Queue(maxsize=32) for lang in target_langs}
     out_q = asyncio.Queue()
 
     def asr_worker():
@@ -260,7 +607,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 break
             try:
                 # VAD отсекает тишину — меньше галлюцинаций Whisper на паузах; beam_size=1 для live-задержки
-                segments, _info = whisper_model.transcribe(buf, beam_size=1, language="ru", vad_filter=True)
+                # язык лекции задаёт браузер (ru/en/de/zh/es), иначе Whisper определяет сам
+                segments, _info = whisper_model.transcribe(buf, beam_size=1, language=whisper_lang, vad_filter=True)
                 text_orig = "".join(s.text for s in segments).strip()
             except Exception:
                 logger.exception("Ошибка распознавания аудио-фрагмента")
@@ -268,7 +616,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if not text_orig:
                 continue
             # Оригинал уходит в браузер сразу, не дожидаясь переводов
-            loop.call_soon_threadsafe(out_q.put_nowait, {"ru": text_orig})
+            loop.call_soon_threadsafe(out_q.put_nowait, {src_lang: text_orig})
             for tq in text_qs.values():
                 _put_latest(tq, text_orig)
 
@@ -280,7 +628,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if text is None:
                 break
             try:
-                translated = translate_with(tokenizer, text, "ru", lang)
+                translated = translate_with(tokenizer, text, src_lang, lang)
             except Exception:
                 logger.exception(f"Ошибка перевода фрагмента ({lang})")
                 continue
@@ -289,7 +637,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     threads = [threading.Thread(target=asr_worker, daemon=True, name="asr-worker")]
     threads += [threading.Thread(target=trans_worker, args=(lang,), daemon=True, name=f"tr-{lang}")
-                for lang in TRANSLATE_LANGS]
+                for lang in target_langs]
     for t in threads:
         t.start()
 
