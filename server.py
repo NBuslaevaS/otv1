@@ -3,18 +3,33 @@ import json
 import logging
 import os
 import queue
+import secrets
 import threading
+import time
 import numpy as np
 import torch
 from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from faster_whisper import WhisperModel
+from faster_whisper.tokenizer import _LANGUAGE_CODES as WHISPER_LANG_CODES
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("online-translate")
 
 app = FastAPI()
+
+# ===== Роли и доступ =====
+# Демо-аккаунты: пароль 1234 у всех. Роль определяет права в интерфейсе и на /ws.
+USERS = {
+    "admin":   ("1234", "admin"),
+    "teacher": ("1234", "teacher"),
+    "student": ("1234", "student"),
+}
+TOKENS = {}     # токен -> роль (выдаётся при входе)
+SESSIONS = []   # активные трансляции лекторов: {"id", "src", "subs": {lang: [asyncio.Queue]}}
+SESSION_SEQ = [0]
+
 
 # ===== Конфигурация live-конвейера (задержки), переопределяется переменными окружения =====
 # На CPU задержка трансляции = скорость моделей + скорость обработки. Всё настраивается:
@@ -53,13 +68,63 @@ except Exception:
 if device == "cuda":
     translation_model.half()  # fp16: ~2x быстрее и меньше VRAM
 
-# Коды языков для NLLB-200
+# Коды языков для NLLB-200 (ключи — ISO 639-1, они же коды языков Whisper)
 NLLB_LANG_CODES = {
-    "ru": "rus_Cyrl",
-    "en": "eng_Latn",
-    "de": "deu_Latn",
-    "zh": "zho_Hans",
-    "es": "spa_Latn"
+    "ru": "rus_Cyrl",   # Русский
+    "en": "eng_Latn",   # English
+    "de": "deu_Latn",   # Deutsch
+    "fr": "fra_Latn",   # Français
+    "es": "spa_Latn",   # Español
+    "it": "ita_Latn",   # Italiano
+    "pt": "por_Latn",   # Português
+    "nl": "nld_Latn",   # Nederlands
+    "pl": "pol_Latn",   # Polski
+    "uk": "ukr_Cyrl",   # Українська
+    "cs": "ces_Latn",   # Čeština
+    "sv": "swe_Latn",   # Svenska
+    "da": "dan_Latn",   # Dansk
+    "fi": "fin_Latn",   # Suomi
+    "no": "nob_Latn",   # Norsk
+    "el": "ell_Grek",   # Ελληνικά
+    "hu": "hun_Latn",   # Magyar
+    "ro": "ron_Latn",   # Română
+    "bg": "bul_Cyrl",   # Български
+    "sr": "srp_Cyrl",   # Српски
+    "hr": "hrv_Latn",   # Hrvatski
+    "tr": "tur_Latn",   # Türkçe
+    "he": "heb_Hebr",   # עברית
+    "ar": "arb_Arab",   # العربية
+    "fa": "pes_Arab",   # فارسی
+    "hi": "hin_Deva",   # हिन्दी
+    "bn": "ben_Beng",   # বাংলা
+    "ur": "urd_Arab",   # اردو
+    "ta": "tam_Taml",   # தமிழ்
+    "zh": "zho_Hans",   # 中文
+    "ja": "jpn_Jpan",    # 日本語
+    "ko": "kor_Hang",   # 한국어
+    "vi": "vie_Latn",   # Tiếng Việt
+    "th": "tha_Thai",   # ไทย
+    "id": "ind_Latn",   # Bahasa Indonesia
+    "ms": "zsm_Latn",   # Bahasa Melayu
+    # --- национальные языки стран СНГ и ближнего зарубежья ---
+    "kk": "kaz_Cyrl",   # Қазақша (Казахстан)
+    "uz": "uzn_Latn",   # Oʻzbekcha (Узбекистан)
+    "tg": "tgk_Cyrl",   # Тоҷикӣ (Таджикистан)
+    "ky": "kir_Cyrl",   # Кыргызча (Киргизия)
+    "tk": "tuk_Latn",   # Türkmençe (Туркменистан)
+    "hy": "hye_Armn",   # Հայերեն (Армения)
+    "az": "azj_Latn",   # Azərbaycanca (Азербайджан)
+    "be": "bel_Cyrl",   # Беларуская (Беларусь)
+    # --- национальные языки Азии, Африки, Карибов, Европы ---
+    "si": "sin_Sinh",   # සිංහල (Шри-Ланка)
+    "mn": "khk_Cyrl",   # Монгол (Монголия, халха)
+    "sw": "swh_Latn",   # Kiswahili (Танзания)
+    "am": "amh_Ethi",   # አማርኛ (Эфиопия)
+    "ha": "hau_Latn",   # Hausa (Нигерия)
+    "yo": "yor_Latn",   # Yorùbá (Нигерия)
+    "ig": "ibo_Latn",   # Igbo (Нигерия)
+    "sk": "slk_Latn",   # Slovenčina (Словакия)
+    "ht": "hat_Latn",   # Kreyòl Ayisyen (Гаити)
 }
 
 TRANSLATE_LANGS = ("en", "de", "zh")  # ru -> эти языки, каждый в своём отдельном потоке
@@ -260,6 +325,24 @@ HTML_TEMPLATE = """
     ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16); border-radius: 8px; }
     ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.28); }
 
+
+    /* ===== Вход и роли ===== */
+    .text-input {
+        display: block; width: 100%; padding: 14px 16px; margin-bottom: 14px; font-size: 16px;
+        color: #eef2ff; background: rgba(0,0,0,0.28); border: 1px solid var(--glass-border);
+        border-radius: 12px; outline: none; transition: .2s;
+    }
+    .text-input:focus { border-color: var(--accent1); box-shadow: 0 0 0 4px rgba(34,211,238,0.18); }
+    .stu-check { display: flex; align-items: center; gap: 10px; font-size: 15px; color: var(--text-soft); margin: 4px 0 20px; cursor: pointer; }
+    .stu-check input { width: 20px; height: 20px; accent-color: var(--accent1); }
+    .lat { float: right; font-size: 13px; font-weight: 600; color: #fbbf24; background: rgba(251,191,36,0.12); border: 1px solid rgba(251,191,36,0.35); border-radius: 999px; padding: 2px 10px; }
+    .notes-btn {
+        display: inline-block; margin-top: 14px; padding: 9px 16px; font-size: 14px; cursor: pointer;
+        color: #a5f3fc; background: rgba(34,211,238,0.10); border: 1px solid rgba(34,211,238,0.4);
+        border-radius: 10px; transition: .2s;
+    }
+    .notes-btn:hover { background: rgba(34,211,238,0.22); }
+    .role-chip { font-size: 13px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; padding: 4px 12px; border-radius: 999px; background: rgba(129,140,248,0.18); border: 1px solid rgba(129,140,248,0.45); color: #c7d2fe; }
     @media (max-width: 640px) {
         .card { padding: 24px 20px; }
         .live-wrap { padding: 14px; }
@@ -271,8 +354,39 @@ HTML_TEMPLATE = """
 <body>
     <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
 
-    <!-- ===== Приветственный экран: заголовок по центру ===== -->
-    <div class="welcome" id="welcomeScreen">
+    <!-- ===== Экран входа ===== -->
+    <div class="welcome" id="loginScreen">
+        <h1 class="title">Локальный синхронный<br>переводчик</h1>
+        <p class="subtitle"><b>Добро пожаловать на сервис!</b><br>Войдите, чтобы начать работу</p>
+        <div class="card" style="width:min(420px,94vw);">
+            <input class="text-input" id="loginInput" placeholder="Логин" autocomplete="username">
+            <input class="text-input" id="passInput" type="password" placeholder="Пароль" autocomplete="current-password">
+            <button class="btn" id="loginBtn" style="margin-top:6px;">Войти &#8594;</button>
+            <div class="error" id="loginError"></div>
+        </div>
+    </div>
+
+    <!-- ===== Экран студента: выбор трансляции ===== -->
+    <div class="welcome" id="studentScreen" style="display:none;">
+        <h1 class="title">Локальный синхронный<br>переводчик</h1>
+        <p class="subtitle"><b>Экран студента</b><br>Выберите идущую лекцию и язык вашего окна перевода</p>
+        <div class="card" id="studentCard">
+            <p class="step-question" style="text-align:center;">Какую лекцию слушать?</p>
+            <div class="lang-row" style="margin-bottom:8px;"><select id="sessSel"></select></div>
+            <div class="counter-note" id="stuSrcInfo">активных трансляций пока нет</div>
+            <p class="step-question" style="text-align:center;margin-top:14px;">Язык вашего окна перевода</p>
+            <div class="lang-row" style="margin-bottom:14px;"><select id="stuLangSel"></select></div>
+            <label class="stu-check"><input type="checkbox" id="stuConfirm">
+                Я подтверждаю язык, на котором лектор ведёт лекцию:
+                <select id="stuSrcSel" style="padding:8px 10px;border-radius:8px;background:#151b2e;color:#eef2ff;border:1px solid var(--glass-border);"></select>
+            </label>
+            <button class="btn" id="stuApplyBtn">Подключиться к переводу &#8594;</button>
+            <div class="error" id="stuError"></div>
+        </div>
+    </div>
+
+    <!-- ===== Приветственный экран лектора: заголовок по центру ===== -->
+    <div class="welcome" id="welcomeScreen" style="display:none;">
         <h1 class="title">Локальный синхронный<br>переводчик</h1>
         <p class="subtitle"><b>Добро пожаловать на сервис!</b><br>Выберите количество языков для перевода лекций</p>
 
@@ -286,10 +400,10 @@ HTML_TEMPLATE = """
             <p class="step-question" style="text-align:center;">Сколько языков перевода нужно?</p>
             <div class="counter">
                 <button type="button" id="minusBtn" title="Меньше">&minus;</button>
-                <input type="number" id="numLangs" min="1" max="4" value="3">
+                <input type="number" id="numLangs" min="1" max="5" value="3">
                 <button type="button" id="plusBtn" title="Больше">+</button>
             </div>
-            <div class="counter-note">от 1 до 4 языков</div>
+            <div class="counter-note" id="counterNote"></div>
             <button class="btn" id="buildBtn">Выбрать языки &#8594;</button>
             <div class="error" id="setupError"></div>
         </div>
@@ -311,10 +425,12 @@ HTML_TEMPLATE = """
         <div class="live-head">
             <span class="mic-dot" id="micDot"></span>
             <span class="live-title">Локальный синхронный переводчик</span>
+            <span class="role-chip" id="roleChip"></span>
             <span class="status" id="status"></span>
             <button class="btn" id="startBtn">&#127908;&nbsp; Начать запись и трансляцию</button>
             <button class="btn danger" id="stopBtn" style="display:none;">&#9632;&nbsp; Стоп</button>
             <button class="btn ghost" id="changeBtn" style="display:none;">&#8634;&nbsp; Изменить языки</button>
+            <button class="btn ghost" id="logoutBtn" style="display:none;">&#128682;&nbsp; Выйти</button>
         </div>
         <div class="grid" id="grid"></div>
     </div>
@@ -324,35 +440,89 @@ HTML_TEMPLATE = """
         let audioContext = null;
         let userStopped = false;
         let targets = [];
+        let token = null, role = null;
+        let sourceLang = "ru";                      // язык лекции
+        let notes = {};              // код языка -> массив фрагментов текста (для конспекта)
+        let latencyShown = false;    // показывать ли задержку (только admin)
+        let listenMode = false;      // студент: только приём, без микрофона
 
-        // Поддерживаемые языки (NLLB + Whisper)
+                // Поддерживаемые языки (NLLB + Whisper)
         const LANGS = {
-            ru: { name: "Русский",   flag: "🇷🇺" },
-            en: { name: "English",   flag: "🇬🇧" },
-            de: { name: "Deutsch",   flag: "🇩🇪" },
-            zh: { name: "中文",       flag: "🇨🇳" },
-            es: { name: "Español",   flag: "🇪🇸" }
+            ru: { name: "Русский",          flag: "🇷🇺" },
+            en: { name: "English",          flag: "🇬🇧" },
+            de: { name: "Deutsch",          flag: "🇩🇪" },
+            fr: { name: "Français",         flag: "🇫🇷" },
+            es: { name: "Español",          flag: "🇪🇸" },
+            it: { name: "Italiano",         flag: "🇮🇹" },
+            pt: { name: "Português",        flag: "🇵🇹" },
+            nl: { name: "Nederlands",       flag: "🇳🇱" },
+            pl: { name: "Polski",           flag: "🇵🇱" },
+            uk: { name: "Українська",       flag: "🇺🇦" },
+            cs: { name: "Čeština",          flag: "🇨🇿" },
+            sv: { name: "Svenska",          flag: "🇸🇪" },
+            da: { name: "Dansk",            flag: "🇩🇰" },
+            fi: { name: "Suomi",            flag: "🇫🇮" },
+            no: { name: "Norsk",            flag: "🇳🇴" },
+            el: { name: "Ελληνικά",         flag: "🇬🇷" },
+            hu: { name: "Magyar",           flag: "🇭🇺" },
+            ro: { name: "Română",           flag: "🇷🇴" },
+            bg: { name: "Български",        flag: "🇧🇬" },
+            sr: { name: "Српски",           flag: "🇷🇸" },
+            hr: { name: "Hrvatski",         flag: "🇭🇷" },
+            tr: { name: "Türkçe",           flag: "🇹🇷" },
+            he: { name: "עברית",            flag: "🇮🇱" },
+            ar: { name: "العربية",          flag: "🇸🇦" },
+            fa: { name: "فارسی",            flag: "🇮🇷" },
+            hi: { name: "हिन्दी",            flag: "🇮🇳" },
+            bn: { name: "বাংলা",            flag: "🇧🇩" },
+            ur: { name: "اردو",             flag: "🇵🇰" },
+            ta: { name: "தமிழ்",            flag: "🇮🇳" },
+            zh: { name: "中文",              flag: "🇨🇳" },
+            ja: { name: "日本語",            flag: "🇯🇵" },
+            ko: { name: "한국어",            flag: "🇰🇷" },
+            vi: { name: "Tiếng Việt",       flag: "🇻🇳" },
+            th: { name: "ไทย",             flag: "🇹🇭" },
+            id: { name: "Bahasa Indonesia", flag: "🇮🇩" },
+            ms: { name: "Bahasa Melayu",    flag: "🇲🇾" },
+            kk: { name: "Қазақша",          flag: "🇰🇿" },
+            uz: { name: "Oʻzbekcha",        flag: "🇺🇿" },
+            tg: { name: "Тоҷикӣ",           flag: "🇹🇯" },
+            ky: { name: "Кыргызча",         flag: "🇰🇬" },
+            tk: { name: "Türkmençe",        flag: "🇹🇲" },
+            hy: { name: "Հայերեն",      flag: "🇦🇲" },
+            az: { name: "Azərbaycanca",     flag: "🇦🇿" },
+            be: { name: "Беларуская",       flag: "🇧🇾" },
+            si: { name: "සිංහල",            flag: "🇱🇰" },
+            mn: { name: "Монгол",           flag: "🇲🇳" },
+            sw: { name: "Kiswahili",        flag: "🇹🇿" },
+            am: { name: "አማርኛ",             flag: "🇪🇹" },
+            ha: { name: "Hausa",            flag: "🇳🇬" },
+            yo: { name: "Yorùbá",           flag: "🇳🇬" },
+            ig: { name: "Igbo",             flag: "🇳🇬" },
+            sk: { name: "Slovenčina",       flag: "🇸🇰" },
+            ht: { name: "Kreyòl Ayisyen",   flag: "🇭🇹" }
         };
-        const TRANSLATE_ORDER = ["en", "de", "zh", "es"];   // языки перевода (без ru)
-        let sourceLang = "ru";                              // язык лекции
 
         const $ = id => document.getElementById(id);
         const numLangs = $("numLangs"), setupError = $("setupError"), applyError = $("applyError");
         const step1Card = $("step1Card"), langSelects = $("langSelects"), selectRows = $("selectRows");
         const welcomeScreen = $("welcomeScreen"), liveScreen = $("liveScreen");
-        const startBtn = $("startBtn"), stopBtn = $("stopBtn"), changeBtn = $("changeBtn");
+        const loginScreen = $("loginScreen"), studentScreen = $("studentScreen");
+        const startBtn = $("startBtn"), stopBtn = $("stopBtn"), changeBtn = $("changeBtn"), logoutBtn = $("logoutBtn");
         const status = $("status"), grid = $("grid"), micDot = $("micDot");
 
+        const MAX_TARGETS = Math.min(5, Object.keys(LANGS).length - 1); // окон перевода максимум 5
+        $("counterNote").innerText = "от 1 до " + MAX_TARGETS + " языков";
         function clampN() {
             let n = parseInt(numLangs.value, 10);
             if (isNaN(n)) n = 1;
-            numLangs.value = Math.min(4, Math.max(1, n));
+            numLangs.value = Math.min(MAX_TARGETS, Math.max(1, n));
         }
         $("minusBtn").onclick = () => { numLangs.value = Math.max(1, (parseInt(numLangs.value,10)||1) - 1); };
-        $("plusBtn").onclick  = () => { numLangs.value = Math.min(4, (parseInt(numLangs.value,10)||1) + 1); };
+        $("plusBtn").onclick  = () => { numLangs.value = Math.min(MAX_TARGETS, (parseInt(numLangs.value,10)||1) + 1); };
         numLangs.onchange = clampN;
 
-        // Язык лекции: любой из пяти; языки перевода — все, кроме выбранного
+        // Язык лекции: любой из базы; языки перевода — все, кроме выбранного
         const srcLangSel = $("srcLang");
         for (const [code, l] of Object.entries(LANGS)) {
             const opt = document.createElement("option");
@@ -372,23 +542,144 @@ HTML_TEMPLATE = """
             micDot.classList.remove("on");
         }
 
+        // ===== Вход =====
+        async function doLogin() {
+            $("loginError").innerText = "";
+            try {
+                const r = await fetch("/api/login", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ login: $("loginInput").value.trim(), password: $("passInput").value })
+                });
+                const d = await r.json();
+                if (!r.ok) { $("loginError").innerText = d.error || "Ошибка входа"; return; }
+                token = d.token; role = d.role;
+                $("roleChip").innerText = role;
+                loginScreen.style.display = "none";
+                if (role === "student") {
+                    openStudentScreen();
+                } else {
+                    latencyShown = (role === "admin");   // время задержки — только у админа
+                    welcomeScreen.style.display = "flex";
+                }
+            } catch (e) { $("loginError").innerText = "Сервер недоступен: " + e.message; }
+        }
+        $("loginBtn").onclick = doLogin;
+        $("passInput").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+
+        logoutBtn.onclick = () => {
+            stopAudio(); userStopped = true;
+            token = null; role = null; listenMode = false;
+            liveScreen.style.display = "none";
+            welcomeScreen.style.display = "none";
+            studentScreen.style.display = "none";
+            loginScreen.style.display = "flex";
+        };
+
+        // ===== Экран студента =====
+        const sessSel = $("sessSel"), stuLangSel = $("stuLangSel"), stuSrcSel = $("stuSrcSel");
+        let stuSessions = [];
+        async function openStudentScreen() {
+            studentScreen.style.display = "flex";
+            await refreshSessions();
+        }
+        async function refreshSessions() {
+            try {
+                const r = await fetch("/api/sessions");
+                stuSessions = await r.json();
+            } catch (e) { stuSessions = []; }
+            sessSel.innerHTML = "";
+            stuLangSel.innerHTML = ""; stuSrcSel.innerHTML = "";
+            if (!stuSessions.length) {
+                const o = document.createElement("option");
+                o.value = ""; o.innerText = "— нет активных лекций —";
+                sessSel.appendChild(o);
+                $("stuSrcInfo").innerText = "Лектор ещё не начал трансляцию — обновите страницу позже";
+                $("stuError").innerText = "";
+                return;
+            }
+            $("stuSrcInfo").innerText = "активных трансляций: " + stuSessions.length;
+            for (const s of stuSessions) {
+                const o = document.createElement("option");
+                o.value = s.id;
+                const src = LANGS[s.src];
+                o.innerText = "Лекция №" + s.id + "  " + (src ? src.flag + " " + src.name : s.src);
+                sessSel.appendChild(o);
+            }
+            onSessionPick();
+        }
+        function onSessionPick() {
+            const s = stuSessions.find(x => String(x.id) === sessSel.value);
+            stuLangSel.innerHTML = ""; stuSrcSel.innerHTML = "";
+            if (!s) return;
+            const src = LANGS[s.src];
+            for (const code of s.langs) {
+                const o = document.createElement("option");
+                o.value = code; o.innerText = LANGS[code].flag + "  " + LANGS[code].name;
+                stuLangSel.appendChild(o);
+            }
+            const os = document.createElement("option");
+            os.value = s.src; os.innerText = src.flag + "  " + src.name;
+            os.selected = true;
+            stuSrcSel.appendChild(os);
+            $("stuConfirm").checked = false;
+        }
+        sessSel.onchange = onSessionPick;
+
+        $("stuApplyBtn").onclick = () => {
+            $("stuError").innerText = "";
+            const s = stuSessions.find(x => String(x.id) === sessSel.value);
+            if (!s) { $("stuError").innerText = "Выберите лекцию"; return; }
+            if (!stuLangSel.value) { $("stuError").innerText = "Выберите язык окна"; return; }
+            if (!$("stuConfirm").checked) {
+                $("stuError").innerText = "Отметьте подтверждение языка, на котором лектор ведёт лекцию";
+                return;
+            }
+            listenMode = true;
+            sourceLang = s.src;   // для заголовка конспекта
+            grid.innerHTML = ""; notes = {};
+            addBox(stuLangSel.value, LANGS[stuLangSel.value].flag + "  " + LANGS[stuLangSel.value].name);
+            studentScreen.style.display = "none";
+            liveScreen.style.display = "flex";
+            startBtn.style.display = "none";
+            stopBtn.style.display = "inline-block";
+            changeBtn.style.display = "none";
+            logoutBtn.style.display = "inline-block";
+            connectStudent(s.id, stuLangSel.value);
+        };
+
+        function connectStudent(sessionId, lang) {
+            setStatus("Подключение к трансляции...");
+            const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+            ws = new WebSocket(`${wsProto}//${window.location.host}/ws`);
+            ws.onopen = () => {
+                ws.send(JSON.stringify({ token, mode: "listen", session: sessionId, lang }));
+                setStatus("Слушаю лекцию №" + sessionId + "...", "#86efac");
+                micDot.classList.add("on");
+            };
+            ws.onmessage = onMessage;
+            ws.onerror = () => setStatus("Ошибка соединения с сервером", "#fda4af");
+            ws.onclose = () => {
+                if (userStopped) return;
+                setStatus("Лекция завершена или соединение закрыто.", "#fda4af");
+                stopBtn.style.display = "none";
+                logoutBtn.style.display = "inline-block";
+            };
+        }
+
+        // ===== Лектор (admin/teacher) =====
         // Шаг 1: ввели количество N -> показываем N выпадающих списков
         $("buildBtn").onclick = () => {
             setupError.innerText = "";
             sourceLang = srcLangSel.value;
             const n = parseInt(numLangs.value, 10);
-            const maxN = Object.keys(LANGS).length - 1; // все языки, кроме языка лекции
+            const maxN = Math.min(MAX_TARGETS, Object.keys(LANGS).length - 1);
             if (isNaN(n) || n < 1 || n > maxN) {
                 setupError.innerText = "Укажите количество от 1 до " + maxN;
                 return;
             }
             // Для перевода доступны ВСЕ языки базы, кроме самого языка лекции
-            // (при иностранном языке лекции в списке оказывается и русский)
             const options = Object.keys(LANGS).filter(c => c !== sourceLang);
-            if (n > options.length) {
-                setupError.innerText = "Для языка лекции доступно " + options.length + " язык(ов) перевода";
-                return;
-            }
             selectRows.innerHTML = "";
             for (let i = 0; i < n; i++) {
                 const row = document.createElement("div");
@@ -414,7 +705,7 @@ HTML_TEMPLATE = """
             step1Card.style.display = "block";
         };
 
-        // Шаг 2: подтвердили языки -> окна с языками, как в первой версии
+        // Шаг 2: подтвердили языки -> окна с языками
         $("applyBtn").onclick = () => {
             applyError.innerText = "";
             const chosen = Array.from(selectRows.querySelectorAll("select")).map(s => s.value);
@@ -423,7 +714,7 @@ HTML_TEMPLATE = """
                 return;
             }
             targets = chosen;
-            grid.innerHTML = "";
+            grid.innerHTML = ""; notes = {};
             addBox(sourceLang, LANGS[sourceLang].flag + "  Оригинал · " + LANGS[sourceLang].name);
             targets.forEach(l => addBox(l, LANGS[l].flag + "  " + LANGS[l].name));
             welcomeScreen.style.display = "none";
@@ -431,6 +722,7 @@ HTML_TEMPLATE = """
             startBtn.style.display = "inline-block";
             stopBtn.style.display = "none";
             changeBtn.style.display = "inline-block";
+            logoutBtn.style.display = "inline-block";
             setStatus("Нажмите «Начать запись и трансляцию» и разрешите доступ к микрофону.");
         };
 
@@ -442,16 +734,67 @@ HTML_TEMPLATE = """
             step1Card.style.display = "block";
         };
 
+        // Окно языка: заголовок + текст; кнопка «скачать конспект» — по правам роли
         function addBox(code, title) {
             const box = document.createElement("div");
             box.className = "lang-box";
             const h = document.createElement("h2");
             h.innerText = title;
+            if (latencyShown && code !== sourceLang) {
+                const lat = document.createElement("span");
+                lat.className = "lat"; lat.id = "lat-" + code; lat.innerText = "задержка: —";
+                h.appendChild(lat);
+            }
             const content = document.createElement("div");
             content.id = "box-" + code;
             content.className = "text-content";
             box.appendChild(h); box.appendChild(content);
+            // teacher: конспект только из окна языка лекции; admin: из всех; student: из своего
+            const mayDownload = (role === "admin") || (role === "student") || (role === "teacher" && code === sourceLang);
+            if (mayDownload) {
+                const b = document.createElement("button");
+                b.className = "notes-btn";
+                b.innerText = "📥  Скачать конспект";
+                b.onclick = () => downloadNotes(code);
+                box.appendChild(b);
+            }
             grid.appendChild(box);
+            notes[code] = [];
+        }
+
+        function downloadNotes(code) {
+            const NL = String.fromCharCode(10);
+            const parts = notes[code] || [];
+            const head = "Конспект лекции — " + (LANGS[code] ? LANGS[code].name : code) + NL +
+                         "Язык лекции: " + (LANGS[sourceLang] ? LANGS[sourceLang].name : sourceLang) + NL +
+                         "Дата: " + new Date().toLocaleString() + NL + "-".repeat(50) + NL + NL;
+            const blob = new Blob([head + parts.join(" ") + NL], { type: "text/plain;charset=utf-8" });
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = "konspekt_" + code + "_" + Date.now() + ".txt";
+            document.body.appendChild(a); a.click();
+            setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+        }
+
+        function onMessage(event) {
+            const data = JSON.parse(event.data);
+            if (data._lat) {   // служебное сообщение: задержка перевода окна (видно только admin)
+                for (const [lang, sec] of Object.entries(data._lat)) {
+                    const el = document.getElementById("lat-" + lang);
+                    if (el) el.innerText = "задержка: " + sec + " с";
+                }
+                return;
+            }
+            if (data.error) { setStatus(data.error, "#fda4af"); return; }
+            // Распределяем полученные переводы по окнам
+            for (const [lang, text] of Object.entries(data)) {
+                const box = document.getElementById("box-" + lang);
+                if (box && text) {
+                    box.innerText += " " + text;
+                    if (notes[lang]) notes[lang].push(text);
+                    box.parentElement.scrollTop = box.parentElement.scrollHeight;
+                }
+            }
         }
 
         async function start() {
@@ -466,8 +809,8 @@ HTML_TEMPLATE = """
 
             ws.onopen = async () => {
                 try {
-                    // Первым сообщением сообщаем серверу язык лекции и языки перевода
-                    ws.send(JSON.stringify({ source: sourceLang, targets: targets }));
+                    // Первым сообщением сообщаем серверу роль, язык лекции и языки перевода
+                    ws.send(JSON.stringify({ token, mode: "lecture", source: sourceLang, targets: targets }));
                     setStatus("Микрофон активен. Говорите...", "#86efac");
                     micDot.classList.add("on");
 
@@ -497,19 +840,7 @@ HTML_TEMPLATE = """
                 }
             };
 
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                // Распределяем полученные переводы по окнам
-                for (const [lang, text] of Object.entries(data)) {
-                    const box = document.getElementById(`box-${lang}`);
-                    if (box && text) {
-                        box.innerText += " " + text;
-                        // Автопрокрутка вниз, чтобы лектор и студенты видели новый текст
-                        box.parentElement.scrollTop = box.parentElement.scrollHeight;
-                    }
-                }
-            };
-
+            ws.onmessage = onMessage;
             ws.onerror = () => setStatus("Ошибка соединения с сервером", "#fda4af");
             ws.onclose = () => {
                 if (userStopped) return;
@@ -535,6 +866,26 @@ HTML_TEMPLATE = """
 </html>
 """
 
+@app.post("/api/login")
+async def login(payload: dict):
+    """Вход: выдаёт токен с ролью (admin / teacher / student)."""
+    name = str(payload.get("login", "")).strip().lower()
+    password = str(payload.get("password", ""))
+    user = USERS.get(name)
+    if not user or user[0] != password:
+        return JSONResponse({"error": "Неверный логин или пароль"}, status_code=401)
+    token = secrets.token_urlsafe(24)
+    TOKENS[token] = user[1]
+    return {"token": token, "role": user[1]}
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    """Список живых трансляций для студентов: id, язык лекции, доступные окна."""
+    return [{"id": s["id"], "src": s["src"], "langs": [l for l in s["subs"] if l != s["src"]]}
+            for s in SESSIONS]
+
+
 @app.get("/")
 async def get():
     return HTMLResponse(HTML_TEMPLATE)
@@ -557,26 +908,60 @@ def _put_latest(q, item) -> None:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Конвейер с малой задержкой вместо последовательной обработки.
+    """Конвейер с малой задержкой.
 
-    Старая версия обрабатывала фрагмент ПОСЛЕДОВАТЕЛЬНО прямо в цикле приёма
-    (ASR + 3 перевода через общий лок ≈ 10 с): пока идет обработка, новые байты
-    микрофона копятся в сокете, и задержка растёт всю лекцию.
-    Теперь цикл приёма только кладёт аудио в очередь, а обработка параллельная:
-    ASR-поток (сразу шлёт оригинал) -> 3 потока-переводчика (en/de/zh),
-    каждый со своим токенизатором; результаты складываются в исходящую очередь.
+    Ролевой протокол (первое сообщение — JSON):
+      лектор:  {"token":..., "mode":"lecture", "source":"de", "targets":["en","zh"]}
+      студент: {"token":..., "mode":"listen", "session":1, "lang":"en"}
+    Legacy-клиенты (первое сообщение не JSON) работают по-старому:
+    ru -> en/de/zh, без прав и без трансляции на студентов.
     """
     await websocket.accept()
     loop = asyncio.get_running_loop()
     chunk_samples = int(16000 * OTV_CHUNK_SEC)
 
-    # Браузер первым сообщением (JSON) присылает язык лекции и языки перевода:
-    # {"source": "de", "targets": ["en", "zh"]}. Без сообщения — ru -> TRANSLATE_LANGS.
-    src_lang = "ru"
-    target_langs = list(TRANSLATE_LANGS)
     try:
         first = await asyncio.wait_for(websocket.receive_text(), timeout=5)
         handshake = json.loads(first) if first.strip().startswith("{") else {}
+    except Exception:
+        handshake = {}
+
+    token = handshake.get("token")
+    role = TOKENS.get(token) if token else None
+    if token and role is None:
+        await websocket.send_text(json.dumps({"error": "Сессия входа истекла — войдите заново"}))
+        await websocket.close()
+        return
+
+    # ---------- Студент: только слушает выбранную трансляцию лектора ----------
+    if role == "student" and handshake.get("mode") == "listen":
+        sess = next((s for s in SESSIONS if s["id"] == handshake.get("session")), None)
+        lang = handshake.get("lang")
+        if not sess or lang not in sess["subs"] or lang == sess["src"]:
+            await websocket.send_text(json.dumps({"error": "Трансляция не найдена или уже закрыта"}))
+            await websocket.close()
+            return
+        q: asyncio.Queue = asyncio.Queue()
+        sess["subs"][lang].append(q)
+        logger.info("Студент слушает сессию %s (язык %s)", sess["id"], lang)
+        try:
+            await websocket.send_text(json.dumps({"ready": sess["id"]}))
+            while True:
+                data = await q.get()
+                await websocket.send_text(json.dumps(data, ensure_ascii=False))
+        except Exception:
+            pass
+        finally:
+            try:
+                sess["subs"][lang].remove(q)
+            except ValueError:
+                pass
+        return
+
+    # ---------- Лектор (admin/teacher) или legacy-клиент ----------
+    src_lang = "ru"
+    target_langs = list(TRANSLATE_LANGS)
+    if handshake:
         req_src = handshake.get("source")
         if req_src in NLLB_LANG_CODES:
             src_lang = req_src
@@ -585,29 +970,42 @@ async def websocket_endpoint(websocket: WebSocket):
             valid = [l for l in dict.fromkeys(requested)
                      if l in NLLB_LANG_CODES and l != src_lang]
             if valid:
-                target_langs = valid
+                target_langs = valid[:5]  # окон перевода максимум 5
             else:
                 target_langs = [l for l in TRANSLATE_LANGS if l != src_lang]
         else:
             target_langs = [l for l in TRANSLATE_LANGS if l != src_lang]
-        logger.info("Трансляция: %s -> %s", src_lang, ", ".join(target_langs))
-    except Exception:
+        logger.info("Трансляция: %s -> %s (роль: %s)", src_lang, ", ".join(target_langs), role or "legacy")
+    else:
         target_langs = [l for l in target_langs if l != src_lang] or list(TRANSLATE_LANGS)
-        # без JSON-рукопожатия — ru -> языки по умолчанию
 
-    whisper_lang = src_lang  # у faster-whisper коды ru/en/de/zh/es совпадают с NLLB-кодами проекта
+    SESSION_SEQ[0] += 1
+    sess = {"id": SESSION_SEQ[0], "src": src_lang,
+            "subs": {l: [] for l in target_langs}, "t0": time.monotonic()}
+    SESSIONS.append(sess)
+
+    def broadcast(lang: str, text: str) -> None:
+        """Разослать перевод студентам, подписанным на это окно."""
+        data = json.dumps({lang: text}, ensure_ascii=False)
+        for sq in sess["subs"].get(lang, []):
+            loop.call_soon_threadsafe(sq.put_nowait, {lang: text})
+
+    # у faster-whisper коды языков совпадают с NLLB-кодами проекта, но не для всех
+    # (киргизский, игбо и др. Whisper не распознаёт) — тогда автоопределение языка
+    whisper_lang = src_lang if src_lang in WHISPER_LANG_CODES else None
     audio_q = queue.Queue(maxsize=40)                                     # ~100 с аудио максимум
     text_qs = {lang: queue.Queue(maxsize=32) for lang in target_langs}
     out_q = asyncio.Queue()
 
     def asr_worker():
         while True:
-            buf = audio_q.get()
-            if buf is None:
+            item = audio_q.get()
+            if item is None:
                 break
+            buf, t_enq = item
             try:
                 # VAD отсекает тишину — меньше галлюцинаций Whisper на паузах; beam_size=1 для live-задержки
-                # язык лекции задаёт браузер (ru/en/de/zh/es), иначе Whisper определяет сам
+                # язык лекции задаёт браузер, иначе Whisper определяет сам
                 segments, _info = whisper_model.transcribe(buf, beam_size=1, language=whisper_lang, vad_filter=True)
                 text_orig = "".join(s.text for s in segments).strip()
             except Exception:
@@ -615,6 +1013,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             if not text_orig:
                 continue
+            sess["t0"] = t_enq  # отсчёт задержки перевода — от момента прихода фрагмента
             # Оригинал уходит в браузер сразу, не дожидаясь переводов
             loop.call_soon_threadsafe(out_q.put_nowait, {src_lang: text_orig})
             for tq in text_qs.values():
@@ -634,6 +1033,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             if translated:
                 loop.call_soon_threadsafe(out_q.put_nowait, {lang: translated})
+                # замер задержки этого окна: от прихода аудио-фрагмента до готового перевода
+                lat = max(0.0, time.monotonic() - sess["t0"])
+                loop.call_soon_threadsafe(out_q.put_nowait, {"_lat": {lang: round(lat, 1)}})
+                broadcast(lang, translated)
 
     threads = [threading.Thread(target=asr_worker, daemon=True, name="asr-worker")]
     threads += [threading.Thread(target=trans_worker, args=(lang,), daemon=True, name=f"tr-{lang}")
@@ -659,13 +1062,17 @@ async def websocket_endpoint(websocket: WebSocket):
             while len(audio_buffer) >= chunk_samples:
                 audio_np = np.array(audio_buffer[:chunk_samples], dtype=np.float32)
                 del audio_buffer[:chunk_samples]
-                _put_latest(audio_q, audio_np)
+                _put_latest(audio_q, (audio_np, time.monotonic()))
     except Exception as e:
         logger.info(f"Соединение закрыто или ошибка: {e}")
     finally:
+        try:
+            SESSIONS.remove(sess)
+        except ValueError:
+            pass
         # Хвост речи (< полного фрагмента, но >=0.5 с) тоже отправляем, чтобы не терялся
         if len(audio_buffer) >= int(16000 * 0.5):
-            _put_latest(audio_q, np.array(audio_buffer, dtype=np.float32))
+            _put_latest(audio_q, (np.array(audio_buffer, dtype=np.float32), time.monotonic()))
         audio_q.put(None)
         try:
             # ждём окончания распознавания хвоста, затем закрываем переводчиков
